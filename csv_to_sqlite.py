@@ -5,6 +5,7 @@ import os
 import sys
 import click
 import time
+from contextlib import closing
 
 
 __version__ = '2.1.3'
@@ -26,6 +27,19 @@ class CsvOptions:
         self.delimiter = delimiter
         self.encoding = encoding
         self.bracket_style = bracket_style
+
+
+class CsvImportError(Exception):
+    """One or more files failed; successful files have already been committed.
+
+    failures contains (file_name, exception) pairs. rows_inserted counts only
+    rows from successful imports, not rows rolled back for failed files.
+    """
+    def __init__(self, failures, rows_inserted):
+        self.failures = failures
+        self.rows_inserted = rows_inserted
+        super().__init__("{0} file(s) failed to import; {1} rows committed from successful files"
+                         .format(len(failures), rows_inserted))
 
 
 class CsvFileInfo:
@@ -188,29 +202,53 @@ def start(file, output, typing, drop_tables, verbose, delimiter, encoding, brack
         print("No files were specified. Exiting.")
         return
     options = CsvOptions(typing_style=typing, drop_tables=drop_tables, delimiter=delimiter, encoding=encoding, bracket_style=bracket_style)
-    write_csv(files, output, options)
+    try:
+        write_csv(files, output, options, raise_on_error=True)
+    except CsvImportError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
-def write_csv(files, output, options):
-    """Writes CSV files. Returns number of rows inserted."""
+def write_csv(files, output, options, *, raise_on_error=False):
+    """Import each CSV atomically and return the number of committed rows.
+
+    Failed files leave their destination tables unchanged; other files are
+    still attempted. Set raise_on_error=True to raise CsvImportError after
+    committing successful files. Connection and commit errors always propagate.
+    """
     write_out("Output file: " + output)
-    conn = sqlite3.connect(output)
     write_out("Typing style: " + options.typing_style)
     totalRowsInserted = 0
+    tablesInserted = 0
+    failures = []
     startTime = time.perf_counter()
-    with click.progressbar(files) as _files:
-        actual = files if write_out.verbose else _files
-        for file in actual:
-            try:
-                file = file.strip()
-                write_out("Processing " + file)
-                with CsvFileInfo(file, options) as info:
-                    info.determine_types()
-                    totalRowsInserted += info.save_to_db(conn)
-            except Exception as exc:
-                print("Error on table {0}: \n {1}".format(file, exc))
-    print("Written {0} rows into {1} tables in {2:.3f} seconds".format(totalRowsInserted, len(files), time.perf_counter() - startTime))
-    conn.commit()
+    with closing(sqlite3.connect(output)) as conn:
+        with conn:
+            # Start before any DDL: sqlite3's implicit transaction only starts
+            # on DML, which otherwise leaves DROP/CREATE outside rollback.
+            conn.execute('BEGIN')
+            with click.progressbar(files) as _files:
+                actual = files if write_out.verbose else _files
+                for file in actual:
+                    conn.execute('SAVEPOINT csv_import')
+                    try:
+                        file = file.strip()
+                        write_out("Processing " + file)
+                        with CsvFileInfo(file, options) as info:
+                            info.determine_types()
+                            rowsInserted = info.save_to_db(conn)
+                    except Exception as exc:
+                        conn.execute('ROLLBACK TO SAVEPOINT csv_import')
+                        conn.execute('RELEASE SAVEPOINT csv_import')
+                        failures.append((file, exc))
+                        print("Error on table {0}: \n {1}".format(file, exc))
+                    else:
+                        conn.execute('RELEASE SAVEPOINT csv_import')
+                        totalRowsInserted += rowsInserted
+                        tablesInserted += 1
+    print("Written {0} rows into {1} tables ({2} failed) in {3:.3f} seconds"
+          .format(totalRowsInserted, tablesInserted, len(failures), time.perf_counter() - startTime))
+    if failures and raise_on_error:
+        raise CsvImportError(failures, totalRowsInserted)
     return totalRowsInserted
 
 if __name__ == "__main__":

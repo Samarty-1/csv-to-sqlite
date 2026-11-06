@@ -37,3 +37,53 @@ input_files = ["abilities.csv", "moves.csv"] # pass in a list of CSV files
 csv_to_sqlite.write_csv(input_files, "output.sqlite", options)
 ```
 
+## Import failures and safe replacement
+
+Each input file is imported atomically. If reading, type detection, table
+creation, or row insertion fails, changes for that file are rolled back.
+A failed new import leaves no partial table. With `--drop-tables`, a failed
+replacement restores the previous table, including its rows, schema and indexes.
+A successful replacement still drops the old table and its indexes as before.
+
+Other input files are still processed. Successful imports are committed at the
+end of the run; the summary counts successful imports and failed files separately.
+The CLI exits with status **1** if any input file failed, so scheduled jobs can
+detect incomplete runs. A run where all imports succeed exits with status **0**.
+
+Python callers keep the existing default: `write_csv` prints per-file errors
+and returns the number of rows committed from successful files. To receive
+structured failures, opt in with `raise_on_error=True`:
+
+```python
+try:
+    rows = csv_to_sqlite.write_csv(
+        input_files, "output.sqlite", options, raise_on_error=True
+    )
+except csv_to_sqlite.CsvImportError as error:
+    # Successful files are already committed; this is not an all-files rollback.
+    print("Rows committed:", error.rows_inserted)
+    for filename, cause in error.failures:
+        print(filename, cause)
+```
+
+Connection, transaction and commit failures propagate rather than producing a
+success summary. An interruption before the final commit rolls back the pending
+run and closes the connection. A newly created, empty database file may remain.
+
+When retrying, select failed inputs or deliberately use `--drop-tables` to
+replace already imported tables; imports do not append to existing tables.
+
+## Tests
+
+From a source checkout:
+
+```sh
+python -m pip install click pytest
+python -m pytest -q
+```
+
+Regression tests use real temporary CSV files and SQLite databases, including
+malformed input after the 10,000-row batch boundary. See
+[the design and verification notes](IMPROVEMENTS.md) for the reproduced failure
+and the transaction design.
+
