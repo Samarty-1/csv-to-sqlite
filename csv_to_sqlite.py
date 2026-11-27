@@ -5,6 +5,7 @@ import os
 import sys
 import click
 import time
+from contextlib import closing
 
 
 __version__ = '2.1.3'
@@ -38,7 +39,7 @@ class CsvFileInfo:
         self.options = options
         if not options:
             self.options = CsvOptions()
-        self.lb, self.rb = ("[", "]") if options.bracket_style == "all" else ("", "")
+        self.lb, self.rb = ("[", "]") if self.options.bracket_style == "all" else ("", "")
 
     def get_table_name(self):
         return os.path.splitext(os.path.basename(self.path))[0]
@@ -188,29 +189,31 @@ def start(file, output, typing, drop_tables, verbose, delimiter, encoding, brack
         print("No files were specified. Exiting.")
         return
     options = CsvOptions(typing_style=typing, drop_tables=drop_tables, delimiter=delimiter, encoding=encoding, bracket_style=bracket_style)
-    write_csv(files, output, options)
+    try:
+        write_csv(files, output, options)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def write_csv(files, output, options):
-    """Writes CSV files. Returns number of rows inserted."""
+    """Writes CSV files atomically. Returns rows inserted; raises on failure."""
     write_out("Output file: " + output)
-    conn = sqlite3.connect(output)
     write_out("Typing style: " + options.typing_style)
     totalRowsInserted = 0
     startTime = time.perf_counter()
-    with click.progressbar(files) as _files:
-        actual = files if write_out.verbose else _files
-        for file in actual:
-            try:
-                file = file.strip()
-                write_out("Processing " + file)
-                with CsvFileInfo(file, options) as info:
-                    info.determine_types()
-                    totalRowsInserted += info.save_to_db(conn)
-            except Exception as exc:
-                print("Error on table {0}: \n {1}".format(file, exc))
+    with closing(sqlite3.connect(output)) as conn:
+        with conn:
+            # Include CREATE/DROP TABLE in the transaction as well as inserts.
+            conn.execute("BEGIN")
+            with click.progressbar(files) as _files:
+                actual = files if write_out.verbose else _files
+                for file in actual:
+                    file = file.strip()
+                    write_out("Processing " + file)
+                    with CsvFileInfo(file, options) as info:
+                        info.determine_types()
+                        totalRowsInserted += info.save_to_db(conn)
     print("Written {0} rows into {1} tables in {2:.3f} seconds".format(totalRowsInserted, len(files), time.perf_counter() - startTime))
-    conn.commit()
     return totalRowsInserted
 
 if __name__ == "__main__":
